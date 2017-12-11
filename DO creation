@@ -1,0 +1,729 @@
+report zlldn015a.
+
+type-pools: abap, cntb, icon.
+
+data :  gt_sodeldata    type standard table of zltsodeldata,"Output table
+        ls_sodeldata    type zltsodeldata,
+        i_fieldcat      type standard table of lvc_s_fcat,"Field catalog
+        i_selected_rows type lvc_t_row,"Selected Rows
+        w_selected_rows type lvc_s_row,
+        i_modified      type standard table of zltsodeldata,"For getting modified rows
+        w_variant       type disvariant,
+        o_docking       type ref to cl_gui_docking_container,"Docking Container
+        o_grid          type ref to cl_gui_alv_grid."Grid
+
+data gv_fcode type table of sy-ucomm.
+
+field-symbols : <fs_fieldcat>  type lvc_s_fcat,
+                <fs_sodeldata> type zltsodeldata.
+
+constants: gc_param_reftosls type bapi_param value 'SALES_ORDER_ITEMS',
+           gc_field_sls_iso  type bapi_fld   value 'SALES_UNIT_ISO'. "^_n_949227
+
+include: lv50if11, shpconst, lv50r_creagso, lv50if12.
+
+tables: vbak,likp.
+
+selection-screen begin of block b1 with frame title text-001.
+parameters: p_crdo   radiobutton group rb1. "Create DO
+select-options: s_so for vbak-vbeln.
+parameters: p_vstel type vbsk-vstel.
+parameters: p_chdo   radiobutton group rb1. "Change DO
+select-options: s_do for likp-vbeln.
+selection-screen end of block b1.
+
+*&---------------------------------------------------------------------*
+*& Macros
+*&---------------------------------------------------------------------*
+define conversion_alpha_input.
+
+  call function 'CONVERSION_EXIT_ALPHA_INPUT'
+    exporting
+      input  = &1
+    importing
+      output = &1.
+
+end-of-definition.
+
+
+at selection-screen.
+
+  if p_crdo = 'X'.
+    if s_so-low is initial or  p_vstel is initial.
+      message 'Sales Order and Shipping Point are required.' type 'E'.
+    endif.
+  elseif p_chdo = 'X'.
+    if s_do-low is initial.
+      message 'Delivery Order is required.' type 'E'.
+    endif.
+  endif.
+
+start-of-selection.
+
+  if p_crdo = 'X'.
+
+*Get the SO schedule details to show
+*proposed delivery dates and quantity
+    select vbup~vbeln vbup~posnr
+      vbep~etenr vbep~edatu vbep~wmeng
+    from vbup as vbup
+    inner join vbep as vbep
+       on vbep~vbeln = vbup~vbeln
+      and vbep~posnr = vbup~posnr
+      into corresponding fields of table gt_sodeldata
+    where vbup~vbeln in s_so
+      and vbup~lfgsa in ('A', 'B').
+
+    if sy-subrc <> 0.
+      message 'No data found' type 'I' display like 'E'.
+      return.
+    endif.
+
+  elseif p_chdo = 'X'.
+
+    select vbeln_i posnr_i lfdat lfimg_i meins_i vrkme_i
+      from wb2_v_likp_lips2
+      into corresponding fields of table gt_sodeldata
+      where vbeln in s_do.
+
+    if sy-subrc <> 0.
+      message 'No data found' type 'I' display like 'E'.
+      return.
+    endif.
+
+  endif.
+
+  call screen 9000.
+
+*&---------------------------------------------------------------------*
+*&      Module  STATUS_9000  OUTPUT
+*&---------------------------------------------------------------------*
+*       PBO
+*----------------------------------------------------------------------*
+
+module status_9000 output.
+
+  if o_docking is initial.
+
+    if  p_crdo = 'X'.
+      set pf-status 'ZSTATUS' excluding 'CHANGE'.
+    else.
+      set pf-status 'ZSTATUS' excluding 'CREATE'.
+    endif.
+
+* Creating Docking Container and grid
+    perform create_object.
+* Fill the fieldcatalog table
+    perform create_fieldcat.
+* Modifying the fieldcatalog table
+    perform modify_fieldcat.
+* Registering edit
+    perform register_edit.
+* Displaying the output
+    perform display_output.
+
+  else.
+
+    append 'CHANGE' to gv_fcode.
+    append 'CREATE' to gv_fcode.
+    set pf-status 'ZSTATUS' excluding gv_fcode.
+* Modifying the fieldcatalog table
+    perform modify_fieldcat_pbo1.
+    o_grid->set_frontend_fieldcatalog( it_fieldcatalog = i_fieldcat  ).
+    call method o_grid->refresh_table_display.
+
+  endif.
+
+endmodule.                 " STATUS_9000  OUTPUT
+
+*&---------------------------------------------------------------------*
+*&      Module  USER_COMMAND_9000  INPUT
+*&---------------------------------------------------------------------*
+*       PAI
+*----------------------------------------------------------------------*
+
+module user_command_9000 input.
+
+  data lv_ucomm type sy-ucomm.
+
+  lv_ucomm = sy-ucomm.
+
+  case lv_ucomm.
+
+    when 'CREATE'.
+
+      perform create_delivery_order.
+
+    when 'CHANGE'.
+
+      perform change_delivery_order.
+
+    when 'CANCEL' or 'EXIT'.
+      perform free_objects.
+      leave program.
+
+    when 'BACK'.
+      perform free_objects.
+      set screen '0'.
+      leave screen.
+
+  endcase.
+
+endmodule.                 " USER_COMMAND_9000  INPUT
+
+*---------------------------------------------------------------------*
+* CLASS lcl_eventhandler DEFINITION
+*---------------------------------------------------------------------*
+*
+*---------------------------------------------------------------------*
+class lcl_eventhandler definition.
+
+  public section.
+
+    class-data:
+          md_cnt type i.
+
+    class-methods:
+    handle_toolbar for event toolbar of cl_gui_alv_grid
+    importing
+      e_object
+      e_interactive
+      sender.
+
+endclass. "lcl_eventhandler DEFINITION
+
+*---------------------------------------------------------------------*
+* CLASS lcl_eventhandler IMPLEMENTATION
+*---------------------------------------------------------------------*
+*
+*---------------------------------------------------------------------*
+class lcl_eventhandler implementation.
+
+  method handle_toolbar.
+
+    data: ls_toolbar type stb_button,
+          ls_menu type stb_btnmnu.
+
+*Delete toolbar buttons
+    clear e_object->mt_toolbar.
+
+  endmethod. "handle_toolbar
+
+endclass. "lcl_eventhandler IMPLEMENTATION
+
+*&---------------------------------------------------------------------*
+*&      Form  create_object
+*&---------------------------------------------------------------------*
+*       Creating Docking Container and grid
+*----------------------------------------------------------------------*
+
+form create_object .
+* Creating Docking Container
+  create object o_docking
+    exporting
+      ratio = '95'.
+
+  if sy-subrc eq 0.
+* Creating Grid
+    create object o_grid
+      exporting
+        i_parent = o_docking.
+  endif.
+
+endform.                    " create_object
+
+*&---------------------------------------------------------------------*
+*&      Form  create_fieldcat
+*&---------------------------------------------------------------------*
+*       Filling the fieldcatalog table
+*----------------------------------------------------------------------*
+
+form create_fieldcat .
+
+* Filling the fieldcatalog table
+  call function 'LVC_FIELDCATALOG_MERGE'
+    exporting
+      i_structure_name       = 'ZLTSODELDATA'
+    changing
+      ct_fieldcat            = i_fieldcat
+    exceptions
+      inconsistent_interface = 1
+      program_error          = 2
+      others                 = 3.
+
+endform.                    " create_fieldcat
+
+*&---------------------------------------------------------------------*
+*&      Form  modify_fieldcat
+*&---------------------------------------------------------------------*
+*       Making the column as ediable
+*----------------------------------------------------------------------*
+
+form modify_fieldcat .
+
+  loop at i_fieldcat assigning <fs_fieldcat>.
+
+
+    if p_chdo = 'X'.
+
+      case <fs_fieldcat>-fieldname.
+
+        when 'VBELN' or 'POSNR' or  'ETENR'   or
+             'EDATU' or 'WMENG' or  'MEINS_I' or
+             'VRKME_I'.
+
+          <fs_fieldcat>-no_out = 'X'. "no display
+
+        when 'LFDAT' or 'LFIMG_I'.
+
+          <fs_fieldcat>-edit = 'X'. "editable
+
+        when 'MESSAGE'.
+
+          <fs_fieldcat>-outputlen = 50.
+          <fs_fieldcat>-scrtext_l = 'Message'.
+          <fs_fieldcat>-scrtext_m = 'Message'.
+          <fs_fieldcat>-scrtext_s = 'Message'.
+
+        when others.
+
+      endcase.
+
+    elseif  p_crdo = 'X'.
+
+      case <fs_fieldcat>-fieldname.
+
+        when 'EDATU' or 'WMENG'.
+
+          <fs_fieldcat>-edit = 'X'. "editable
+
+        when 'MEINS_I' or 'VRKME_I'.
+
+          <fs_fieldcat>-no_out = 'X'. "no display
+
+        when 'MESSAGE'.
+
+          <fs_fieldcat>-outputlen = 35.
+          <fs_fieldcat>-scrtext_l = 'Message'.
+          <fs_fieldcat>-scrtext_m = 'Message'.
+          <fs_fieldcat>-scrtext_s = 'Message'.
+
+
+        when others.
+
+      endcase.
+
+    endif.
+
+
+  endloop.
+
+endform.                    " modify_fieldcat
+
+*&---------------------------------------------------------------------*
+*&      Form  modify_fieldcat
+*&---------------------------------------------------------------------*
+*       Making the column as ediable
+*----------------------------------------------------------------------*
+
+form modify_fieldcat_pbo1.
+
+  loop at i_fieldcat assigning <fs_fieldcat> where edit = 'X'.
+    clear <fs_fieldcat>-edit. "non-editable
+  endloop.
+
+endform.                    " modify_fieldcat
+*&---------------------------------------------------------------------*
+*&      Form  register_edit
+*&---------------------------------------------------------------------*
+*       Registering Edit
+*----------------------------------------------------------------------*
+
+form register_edit .
+  call method o_grid->register_edit_event
+    exporting
+      i_event_id = cl_gui_alv_grid=>mc_evt_modified.
+endform.                    " register_edit
+
+*&---------------------------------------------------------------------*
+*&      Form  display_output
+*&---------------------------------------------------------------------*
+*       Displaying the output
+*----------------------------------------------------------------------*
+
+form display_output .
+
+  w_variant-report = sy-repid.
+
+* Displaying the output
+  call method o_grid->set_table_for_first_display
+    exporting
+      is_variant                    = w_variant
+      i_save                        = 'A'
+    changing
+      it_outtab                     = gt_sodeldata
+      it_fieldcatalog               = i_fieldcat
+    exceptions
+      invalid_parameter_combination = 1
+      program_error                 = 2
+      too_many_lines                = 3
+      others                        = 4.
+
+* Set event handler for event TOOLBAR
+  set handler lcl_eventhandler=>handle_toolbar for o_grid.
+  o_grid->set_toolbar_interactive( ).
+
+  if sy-subrc <> 0.
+    message id sy-msgid type sy-msgty number sy-msgno
+    with sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+  endif.
+
+endform.                    " display_output
+
+*&---------------------------------------------------------------------*
+*&      Form  free_objects
+*&---------------------------------------------------------------------*
+*       Free Objects
+*----------------------------------------------------------------------*
+
+form free_objects .
+  call method o_grid->free
+    exceptions
+      cntl_error        = 1
+      cntl_system_error = 2
+      others            = 3.
+  if sy-subrc <> 0.
+    message id sy-msgid type sy-msgty number sy-msgno
+    with sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+  endif.
+
+  call method o_docking->free
+    exceptions
+      cntl_error        = 1
+      cntl_system_error = 2
+      others            = 3.
+  if sy-subrc <> 0.
+    message id sy-msgid type sy-msgty number sy-msgno
+    with sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+  endif.
+
+endform.                    " free_objects
+
+*&---------------------------------------------------------------------*
+*&      Form  create_sales_order
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+form create_delivery_order.
+
+  types: begin of ty_vbap1,
+          vbeln type vbap-vbeln,
+          posnr type vbap-posnr,
+          vrkme type vbap-vrkme,
+         end of ty_vbap1.
+
+  data: lt_so_items    type table of bapidlvreftosalesorder,
+        lt_ser_nos     type table of bapidlvserialnumber,
+        lt_ser_nos_out type shp_sernr_t,
+        lt_return      type table of bapiret2,
+        lt_items_in    type shp_sls_itm_t,
+        lt_create_data type shp_vorgabe_daten_t,
+        lt_mess_vbfs   type vbfs_t,
+        lt_vbap1       type standard table of ty_vbap1,
+        lt_vbls        type standard table of vbls,
+        lt_vbuk        type standard table of vbukvb,
+        lt_vbup        type standard table of vbupvb,
+        lt_vbfa        type standard table of vbfavb.
+
+  data: ls_create_data type shp_vorgabe_daten,
+        ls_vbsk        type vbsk,
+        ls_vbsk_e      type vbsk,
+        ls_vbfs        type vbfs,
+        ls_vbap1       type ty_vbap1,
+        ls_vbap        type vbapvb,
+        ls_vbls        type vbls,
+        ls_so_items    type bapidlvreftosalesorder.
+
+  data: it_sls_items   type shp_sls_itm_t,
+        ls_sd_order    type shp_vl10_sd_order,
+        lt_mess        type vbfs_t,
+        lv_rc          type sysubrc.
+
+  data: ls_message_text type string,
+        ls_message type string.
+
+  define message_text_build.
+    call function 'MESSAGE_TEXT_BUILD'
+      exporting
+        msgid               = &1
+        msgnr               = &2
+        msgv1               = &3
+        msgv2               = &4
+        msgv3               = &5
+        msgv4               = &6
+      importing
+        message_text_output = &7.
+  end-of-definition.
+
+  if gt_sodeldata is not initial.
+    select vbeln posnr vrkme
+      into table lt_vbap1
+            from vbap
+      for all entries in gt_sodeldata
+      where vbeln = gt_sodeldata-vbeln
+        and posnr = gt_sodeldata-posnr.
+  endif.
+
+  loop at gt_sodeldata assigning <fs_sodeldata> casting.
+
+    clear: ls_so_items, lt_so_items, lt_ser_nos, lt_return.
+    ls_so_items-ref_doc    = <fs_sodeldata>-vbeln.
+    conversion_alpha_input ls_so_items-ref_doc.
+    ls_so_items-ref_item   = <fs_sodeldata>-posnr.
+    conversion_alpha_input ls_so_items-ref_item.
+    ls_so_items-dlv_qty    = <fs_sodeldata>-wmeng.
+    clear ls_vbap.
+    read table lt_vbap1 into ls_vbap1 with key vbeln = <fs_sodeldata>-vbeln
+                                             posnr = <fs_sodeldata>-posnr.
+    ls_so_items-sales_unit = ls_vbap1-vrkme. "'EA'.
+    append ls_so_items to lt_so_items.
+
+*Referenced subroutine from BAPI_OUTB_DELIVERY_CREATE_SLS
+*Map to internal format
+    clear: lt_items_in, lt_ser_nos_out, lv_rc.
+    perform bapi_sls_map_to_internal tables lt_so_items
+                                            lt_ser_nos
+                                            lt_return
+                                   changing lt_items_in
+                                            lt_ser_nos_out
+                                            lv_rc.
+
+    if lt_items_in is not initial.
+
+*Referenced subroutine from SHP_DELIVERY_CREATE_FROM_SLS
+      clear: lv_rc,lt_mess, ls_sd_order.
+      perform dcs_get_sales_order using lt_items_in
+                               changing ls_sd_order
+                                        lt_mess
+                                        lv_rc.
+
+*Collective Processing for a Sales Document Header
+      ls_vbsk-vstel = p_vstel. "Shipping Point/Receiving Point
+
+*DO creation data
+      clear: ls_create_data, lt_create_data.
+      ls_create_data-vgbel = <fs_sodeldata>-vbeln. "Sales Order
+      conversion_alpha_input ls_create_data-vgbel.
+      ls_create_data-vgpos = <fs_sodeldata>-posnr. "'10'.        "Sales Order Item
+      conversion_alpha_input ls_create_data-vgpos.
+      ls_create_data-lfimg = <fs_sodeldata>-wmeng. "2.
+
+      clear ls_vbap.
+      read table ls_sd_order-vbap into ls_vbap
+                              with key vbeln = ls_create_data-vgbel
+                                       posnr = ls_create_data-vgpos.
+      ls_create_data-vrkme = ls_vbap-vrkme. "Sales unit
+      ls_create_data-akmng = 'A'.           "Qty in alternative unit of measure (LFIMG)
+      ls_create_data-datum = <fs_sodeldata>-edatu. "Delivery date
+      ls_create_data-datvw = '2'.         "Date is planned delivery date at customer
+      append ls_create_data to lt_create_data.
+
+* create delivery
+      clear: lt_vbls, lt_vbuk, lt_vbup, lt_vbfa, lt_mess_vbfs.
+      call function 'RV_DELIVERY_CREATE'
+        exporting
+          vbsk_i             = ls_vbsk
+          it_vorgabe_daten   = lt_create_data
+          if_nur_vorgabe_pos = 'X'
+          if_vbls_pos_rueck  = 'X'
+          if_synchron        = space
+          if_no_deque        = 'X'
+          it_sernr           = lt_ser_nos_out
+        importing
+          vbsk_e             = ls_vbsk_e
+        tables
+          lvbak              = ls_sd_order-vbak
+          lvbap              = ls_sd_order-vbap
+          lvbep              = ls_sd_order-vbep
+          lvbfa              = ls_sd_order-vbfa
+          lvbfs              = lt_mess_vbfs
+          lvbkd              = ls_sd_order-vbkd
+          lvbls              = lt_vbls
+          lvbpa              = ls_sd_order-vbpa
+          lvbuk              = ls_sd_order-vbuk
+          lvbup              = ls_sd_order-vbup
+          et_vbuk            = lt_vbuk
+          et_vbup            = lt_vbup
+          et_vbfa            = lt_vbfa
+        exceptions
+          error_message      = 1
+          others             = 2.
+
+      if sy-subrc = 0.
+
+        clear ls_vbls.
+        loop at lt_vbls into ls_vbls where lfdat is not initial.
+          <fs_sodeldata>-vbeln_i  = ls_vbls-vbeln_lif. "DO number
+          <fs_sodeldata>-posnr_i  = ls_vbls-posnr_lif. "DO item
+          <fs_sodeldata>-lfdat    = ls_vbls-lfdat.    "DO delivery date
+          <fs_sodeldata>-lfimg_i  = ls_vbls-lfimg.
+          <fs_sodeldata>-message  = 'Delivery is created'.
+          exit.
+        endloop.
+
+        if sy-subrc <> 0 and lt_mess_vbfs is not initial. "Check why DO is not created.
+
+          clear ls_vbfs.
+          read table lt_mess_vbfs into ls_vbfs with key msgty = 'I'.
+          if sy-subrc = 0.
+            message_text_build ls_vbfs-msgid ls_vbfs-msgno ls_vbfs-msgv1
+                               ls_vbfs-msgv2 ls_vbfs-msgv3 ls_vbfs-msgv4
+                               ls_message_text.
+            concatenate 'Information: ' ls_message_text into ls_message.
+          endif.
+
+          clear ls_vbfs.
+          read table lt_mess_vbfs into ls_vbfs with key msgty = 'E'.
+          if sy-subrc = 0.
+            message_text_build ls_vbfs-msgid ls_vbfs-msgno ls_vbfs-msgv1
+            ls_vbfs-msgv2 ls_vbfs-msgv3 ls_vbfs-msgv4
+            ls_message_text.
+            if ls_vbfs-msgty = 'E' and ls_message is not initial.
+              concatenate 'Error: ' ls_message_text ' / ' ls_message into ls_message.
+            else.
+              concatenate 'Error: ' ls_message_text into ls_message.
+            endif.
+          endif.
+
+        else.
+
+          <fs_sodeldata>-message = 'Error calling Delivery create function'.
+
+        endif.
+
+        <fs_sodeldata>-message = ls_message.
+        clear: ls_message_text, ls_message.
+
+      else.
+        <fs_sodeldata>-message = 'Delivery Order creation failed'.
+      endif.
+
+      wait up to 1 seconds.
+
+    else.
+
+      <fs_sodeldata>-message = 'Delivery Order creation failed'.
+      continue. "Skip record
+
+    endif. "IF lt_items_in IS NOT INITIAL.
+
+  endloop.
+
+endform.                    "create_sales_order
+
+*&---------------------------------------------------------------------*
+*&      Form  change_delivery_order
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+form change_delivery_order.
+
+  data: lt_header_deadlines type table of bapidlvdeadln,
+        lt_item_data        type table of bapiobdlvitemchg,
+        lt_item_control     type table of bapiobdlvitemctrlchg,
+        lt_return           type table of bapiret2.
+
+  data: ls_header_data      type bapiobdlvhdrchg,
+        ls_header_control   type bapiobdlvhdrctrlchg,
+        ls_delivery         type bapiobdlvhdrchg-deliv_numb,
+        ls_item_data        type bapiobdlvitemchg,
+        ls_item_control     type bapiobdlvitemctrlchg,
+        ls_header_deadlines type bapidlvdeadln,
+        ls_return           type bapiret2.
+
+  data: lv_stimestamp type string,
+        lv_timestamp type tzntstmps.
+
+  loop at gt_sodeldata assigning <fs_sodeldata> casting.
+
+    ls_header_data-deliv_numb = <fs_sodeldata>-vbeln_i.
+
+*Header data change control
+    ls_header_control-deliv_numb = <fs_sodeldata>-vbeln_i.
+    ls_header_control-deliv_date_flg = 'X'.
+    ls_header_control-pick_date_flg  = 'X'.
+    ls_header_control-trsp_date_flg  = 'X'.
+    ls_header_control-load_date_flg  = 'X'.
+    ls_header_control-gdsi_date_flg  = 'X'.
+
+*Header data change details
+    clear lt_header_deadlines.
+
+    do 5 times.
+
+      case sy-index.
+        when 1.
+          ls_header_deadlines-timetype      = 'WSHDRLFDAT'. "Delivery DATE
+        when 2.
+          ls_header_deadlines-timetype      = 'WSHDRWADAT'. "Planned goods issue DATE
+        when 3.
+          ls_header_deadlines-timetype      = 'WSHDRLDDAT'. "Loading DATE
+        when 4.
+          ls_header_deadlines-timetype      = 'WSHDRTDDAT'. "Transportation planning DATE
+        when 5.
+          ls_header_deadlines-timetype      = 'WSHDRKODAT'. "Picking DATE
+        when others.
+      endcase.
+
+      ls_header_deadlines-deliv_numb    = <fs_sodeldata>-vbeln_i.
+      concatenate <fs_sodeldata>-lfdat sy-uzeit into lv_stimestamp.
+      lv_timestamp = lv_stimestamp.
+      ls_header_deadlines-timestamp_utc = lv_timestamp.
+      append ls_header_deadlines to lt_header_deadlines.
+
+    enddo.
+
+*Item data change details
+    clear lt_item_data.
+    ls_item_data-deliv_numb     = <fs_sodeldata>-vbeln_i.
+    ls_item_data-deliv_item     = <fs_sodeldata>-posnr_i.
+    ls_item_data-dlv_qty        = <fs_sodeldata>-lfimg_i.
+    ls_item_data-dlv_qty_imunit = <fs_sodeldata>-lfimg_i.
+    ls_item_data-sales_unit     = <fs_sodeldata>-vrkme_i.
+    ls_item_data-base_uom       = <fs_sodeldata>-meins_i.
+    ls_item_data-fact_unit_nom   = 1.
+    ls_item_data-fact_unit_denom = 1.
+    append ls_item_data to lt_item_data.
+
+*Item data change control
+    clear lt_item_control.
+    ls_item_control-deliv_numb = <fs_sodeldata>-vbeln_i. "'0630000051'.
+    ls_item_control-deliv_item = <fs_sodeldata>-posnr_i.    "'000010'.
+    ls_item_control-chg_delqty = 'X'.
+    append ls_item_control to lt_item_control.
+
+    call function 'BAPI_OUTB_DELIVERY_CHANGE'
+      exporting
+        header_data      = ls_header_data
+        header_control   = ls_header_control
+        delivery         = ls_delivery
+      tables
+        header_deadlines = lt_header_deadlines
+        item_data        = lt_item_data
+        item_control     = lt_item_control
+        return           = lt_return.
+
+
+    call function 'BAPI_TRANSACTION_COMMIT'
+      exporting
+        wait = 'X'.
+
+
+    read table lt_return into ls_return with key type = 'E'.
+    if sy-subrc <> 0.
+      <fs_sodeldata>-message  = 'Delivery is changed'.
+    endif.
+
+  endloop.  
+
+endform.                    "change_delivery_order 
